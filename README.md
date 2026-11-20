@@ -100,6 +100,45 @@ plugins:
 `x-langfuse-ingestion-version: 4` avoids a delay of up to ten minutes on
 directly ingested OTLP data.
 
+### OpenInference-compatible backends
+
+The plugin emits OpenInference attributes alongside its existing GenAI and
+Langfuse attributes; there is no separate switch for this. Compatible backends
+include Arize Phoenix. The root span is marked `CHAIN`, each upstream attempt
+is marked `LLM`, and available session, model and token fields are included.
+
+```yaml
+plugins:
+  configs:
+    cliproxy-tracing:
+      enabled: true
+      endpoint: "http://otel-backend:6006/v1/traces"
+      protocol: protobuf
+      capture_content: true
+```
+
+Use the backend's actual hostname and port; containers on the same Docker
+network can use the service name. Configure `headers` if authentication is
+required. `protocol` selects OTLP/HTTP encoding: `json` is the default and
+`protobuf` sends `application/x-protobuf`. The encoding setting is independent
+of the OpenInference attributes. Use Protobuf when the receiver requires it.
+
+Content capture is opt-in. With `capture_content: true`, the last attempt
+carries indexed input/output messages and the full captured history; tool calls
+and results are represented within messages, not as separate tool-execution
+spans. The root span carries `input.value` and `output.value` as bounded plain
+text summaries: the most recent user text and the response text or tool names.
+This supports session-turn views; tool-only follow-ups can still display the
+preceding user message. Without captured content these fields are absent.
+Captured prompts and responses are not automatically redacted.
+
+Responses API `input_text` and `output_text` blocks are treated as text;
+`function_call` and `function_call_output` history items are correlated by
+`call_id`. Unknown blocks are retained as labeled text when possible. Previously
+stored traces are not changed. The export batch size is calculated using the
+JSON representation before Protobuf conversion, and Protobuf partial-success
+responses are not decoded by this version.
+
 ### Any other OTLP/HTTP endpoint
 
 Point `endpoint` at a collector's traces URL, e.g.
@@ -114,6 +153,7 @@ Settings live under `plugins.configs.cliproxy-tracing`. Every key is optional.
 |---|---|---|---|
 | `endpoint` | string | empty | OTLP/HTTP traces URL. Empty disables export entirely. |
 | `headers` | object | `{}` | Extra export headers, as a map or a list of `"Name: Value"`. |
+| `protocol` | string | `json` | OTLP/HTTP wire format: `json` or `protobuf`. |
 | `service_name` | string | `cliproxyapi` | OpenTelemetry `service.name`. |
 | `capture_content` | boolean | `false` | Export prompt and completion text. |
 | `max_content_chars` | integer | `32768` | Longest single message exported. |
@@ -164,9 +204,9 @@ Backends enforce a body limit on an ingest request and reject an oversized one
 whole: PostHog answers `413` above 4 MiB and discards every span in the request,
 not just the large one. A batch therefore has to be split before it gets there.
 
-Two things keep it under the limit. Content is attached to one span per trace,
-the attempt that answered, rather than to the root and every retry span, which
-had multiplied a long conversation by the attempt count. And batches split on
+Two things keep it under the limit. Full conversation content is attached to
+the last attempt, not every retry; the root additionally receives bounded turn
+summaries. When there are no attempts the root carries the conversation. Batches split on
 encoded bytes as well as span count, with a 3 MiB default budget that leaves
 headroom under the 4 MiB limit. A batch that is still refused is halved and
 retried rather than dropped.
@@ -198,7 +238,9 @@ reported to the host log.
 
 ## Build
 
-Requires Go 1.24+ and a C compiler (cgo).
+Requires Go 1.24+ and a C compiler (cgo). For a container-only Linux build, run
+`docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm bash -c './build.sh'`
+from the project directory.
 
 ```sh
 ./build.sh                     # -> cliproxy-tracing-v0.2.2.so (linux/amd64)

@@ -58,6 +58,7 @@ func (e *permanentError) isPayloadTooLarge() bool {
 type exporter struct {
 	mu       sync.Mutex
 	endpoint string
+	protocol string
 	headers  map[string]string
 	timeout  time.Duration
 	client   *http.Client
@@ -98,6 +99,7 @@ func (e *exporter) configure(cfg config) {
 	e.mu.Lock()
 	old := e.client
 	e.endpoint = strings.TrimSpace(cfg.Endpoint)
+	e.protocol = cfg.Protocol
 	e.headers = headers
 	e.timeout = timeout
 	e.client = client
@@ -162,7 +164,7 @@ func (e *exporter) send(ctx context.Context, req otlpRequest) error {
 // not marshalled twice.
 func (e *exporter) sendEncoded(ctx context.Context, body []byte) error {
 	e.mu.Lock()
-	endpoint, headers, client := e.endpoint, e.headers, e.client
+	endpoint, headers, client, protocol := e.endpoint, e.headers, e.client, e.protocol
 	e.mu.Unlock()
 
 	if endpoint == "" {
@@ -172,12 +174,21 @@ func (e *exporter) sendEncoded(ctx context.Context, body []byte) error {
 		return errors.New("no http client")
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	contentType := "application/json"
+ if protocol == "protobuf" {
+  var payload otlpRequest
+  if err := json.Unmarshal(body, &payload); err != nil { return fmt.Errorf("decode otlp batch: %w", err) }
+  var err error
+  body, err = encodeProtobuf(payload)
+  if err != nil { return fmt.Errorf("encode otlp protobuf: %w", err) }
+  contentType = "application/x-protobuf"
+ }
+ httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		// The endpoint can carry credentials in its userinfo; never echo it.
 		return fmt.Errorf("build export request: %v", sanitizeURL(endpoint))
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", contentType)
 	httpReq.Header.Set("User-Agent", pluginID+"/"+pluginVersion)
 	for name, value := range headers {
 		httpReq.Header.Set(name, value)

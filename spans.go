@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // OTLP/HTTP JSON wire types. Field names are the OpenTelemetry proto3 JSON
@@ -124,6 +125,8 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 	model := firstNonEmpty(tr.RequestedModel, tr.Model)
 
 	var root attrs
+	root.str("openinference.span.kind", "CHAIN")
+	root.str("session.id", tr.SessionID)
 	root.str("cpa.trace_id", tr.TraceID)
 	root.str("cpa.request_id", tr.RequestID)
 	root.str("cpa.outcome", tr.Outcome)
@@ -160,8 +163,21 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 	}
 	// With no attempt recorded there is no child span to carry the
 	// conversation, so the root takes it rather than losing it.
-	if cfg.CaptureContent && len(tr.Attempts) == 0 {
-		addContentAttrs(&root, tr, cfg)
+	if cfg.CaptureContent {
+		if len(tr.Attempts) == 0 {
+			addContentAttrs(&root, tr, cfg)
+			// Replace the JSON-valued fallbacks with readable turn summaries.
+			filtered := root[:0]
+			for _, kv := range root {
+				switch kv.Key {
+				case "input.value", "input.mime_type", "output.value", "output.mime_type":
+				default:
+					filtered = append(filtered, kv)
+				}
+			}
+			root = filtered
+		}
+		addSessionTurnAttrs(&root, tr, cfg)
 	}
 	rootSpan.Attributes = root
 
@@ -171,6 +187,16 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 		u := &tr.Attempts[i]
 		sid := newSpanID()
 		var a attrs
+		a.str("openinference.span.kind", "LLM")
+		a.str("session.id", tr.SessionID)
+		a.str("llm.model_name", firstNonEmpty(u.ResponseModel, u.Model))
+		a.str("llm.provider", u.Provider)
+		a.integer("llm.token_count.prompt", u.Detail.InputTokens)
+		a.integer("llm.token_count.completion", u.Detail.OutputTokens)
+		a.nonZero("llm.token_count.total", u.Detail.TotalTokens)
+		a.nonZero("llm.token_count.prompt_details.cache_read", u.Detail.CacheReadTokens)
+		a.nonZero("llm.token_count.prompt_details.cache_write", u.Detail.CacheCreationTokens)
+		a.nonZero("llm.token_count.completion_details.reasoning", u.Detail.ReasoningTokens)
 		a.str("gen_ai.system", u.Provider)
 		a.str("gen_ai.provider.name", u.Provider)
 		a.str("gen_ai.request.model", u.Model)
@@ -237,6 +263,59 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 	return spans
 }
 
+// The Phoenix session view reads input.value and output.value from the root.
+// Keep only the latest user text and this response, bounded independently of
+// the full conversation stored on the last attempt.
+func addSessionTurnAttrs(a *attrs, tr *finishedTrace, cfg config) {
+	msgs := promptMessages(tr.PromptJSON)
+	var input string
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "user" {
+			continue
+		}
+		var text []string
+		for _, p := range msgs[i].Parts {
+			if p.Type == partText && p.Content != "" {
+				text = append(text, p.Content)
+			}
+		}
+		if len(text) > 0 {
+			input = strings.Join(text, "\n")
+			break
+		}
+	}
+	var output []string
+	for _, p := range tr.Completion {
+		switch p.Type {
+		case partText:
+			if p.Content != "" { output = append(output, p.Content) }
+		case partToolCall, partServerToolCall:
+			if p.Name != "" { output = append(output, "Tool call: " + p.Name) }
+		}
+	}
+	limit := cfg.MaxContentChars
+	if limit <= 0 || (cfg.MaxTraceContentBytes > 0 && cfg.MaxTraceContentBytes < limit) {
+		limit = cfg.MaxTraceContentBytes
+	}
+	if input = sessionTurnLimit(input, limit); input != "" {
+		a.str("input.value", input)
+		a.str("input.mime_type", "text/plain")
+	}
+	if text := sessionTurnLimit(strings.Join(output, "\n"), limit); text != "" {
+		a.str("output.value", text)
+		a.str("output.mime_type", "text/plain")
+	}
+}
+
+func sessionTurnLimit(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit { return s }
+	const marker = "...[truncated]"
+	if limit <= len(marker) { return marker[:limit] }
+	end := limit - len(marker)
+	for end > 0 && !utf8.ValidString(s[:end]) { end-- }
+	return s[:end] + marker
+}
+
 // addContentAttrs attaches the conversation to a span.
 //
 // Content is emitted once per trace, not once per span. A request with three
@@ -254,7 +333,11 @@ func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
 	prompt := trimPrompt(promptMessages(tr.PromptJSON), cfg)
 	out := trimCompletion(tr.Completion, cfg)
 
+	addOpenInferenceMessages(a, "llm.input_messages", prompt)
+	addOpenInferenceMessages(a, "llm.output_messages", []chatMessage{{Role: "assistant", Parts: out}})
 	if in := messagesJSON(prompt); in != "" {
+		a.str("input.value", in)
+		a.str("input.mime_type", "application/json")
 		// PostHog: gen_ai.input.messages -> $ai_input.
 		a.str("gen_ai.input.messages", in)
 		// Langfuse native, which takes precedence over the generic form.
@@ -262,6 +345,8 @@ func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
 	}
 	if len(out) > 0 {
 		if encoded := messagesJSON([]chatMessage{{Role: "assistant", Parts: out}}); encoded != "" {
+			a.str("output.value", encoded)
+			a.str("output.mime_type", "application/json")
 			a.str("gen_ai.output.messages", encoded)
 			a.str("langfuse.observation.output", encoded)
 		}
@@ -497,4 +582,31 @@ func newSpanID() string {
 		return "0000000000000000"
 	}
 	return hex.EncodeToString(buf[:])
+}
+
+// OpenInference represents message arrays as indexed OTLP attributes.
+func addOpenInferenceMessages(a *attrs, prefix string, messages []chatMessage) {
+ for i, m := range messages {
+  if len(m.Parts) == 0 { continue }
+  key := prefix + "." + strconv.Itoa(i)
+  a.str(key + ".message.role", m.Role)
+  var texts []string
+  toolIndex := 0
+  for _, p := range m.Parts {
+   switch p.Type {
+   case partToolCall, partServerToolCall:
+    t := key + ".message.tool_calls." + strconv.Itoa(toolIndex) + ".tool_call"
+    a.str(t + ".id", p.ID)
+    a.str(t + ".function.name", p.Name)
+    a.str(t + ".function.arguments", string(p.Arguments))
+    toolIndex++
+   case partToolCallResp, partServerToolResp:
+    a.str(key + ".message.tool_call_id", p.ID)
+    texts = append(texts, partToText(p))
+   default:
+    texts = append(texts, partToText(p))
+   }
+  }
+  a.str(key + ".message.content", strings.Join(texts, "\n"))
+ }
 }

@@ -24,6 +24,7 @@ type config struct {
 	Endpoint    string
 	Headers     map[string]string
 	ServiceName string
+	Protocol string
 
 	// CaptureContent turns on prompt and completion export. Off by default.
 	CaptureContent bool
@@ -58,6 +59,7 @@ func defaultConfig() config {
 		Enabled:              true,
 		Headers:              map[string]string{},
 		ServiceName:          "cliproxyapi",
+		Protocol:             "json",
 		CaptureContent:       false,
 		MaxContentChars:      32 * 1024,
 		MaxTraceContentBytes: 512 * 1024,
@@ -108,6 +110,12 @@ func parseConfig(raw []byte) (config, []string, error) {
 			cfg.ServiceName = name
 		}
 	}
+	if v, ok := values["protocol"]; ok && v != nil {
+        switch strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) {
+        case "json", "protobuf": cfg.Protocol = strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+        default: warnings = append(warnings, "protocol: expected json or protobuf; using json")
+        }
+    }
 	if v, ok := values["capture_content"]; ok && v != nil {
 		if b, okB := toBool(v); okB {
 			cfg.CaptureContent = b
@@ -275,6 +283,7 @@ func configFields() []configField {
 		{"endpoint", "string", nil, "OTLP/HTTP traces URL. PostHog: https://us.i.posthog.com/i/v0/ai/otel. Langfuse: https://cloud.langfuse.com/api/public/otel. Empty disables export."},
 		{"headers", "object", nil, "Extra export headers, e.g. Authorization. Values are never logged."},
 		{"service_name", "string", d.ServiceName, "OpenTelemetry service.name resource attribute."},
+		{"protocol", "string", d.Protocol, "OTLP/HTTP wire format: json or protobuf."},
 		{"capture_content", "boolean", d.CaptureContent, "Export prompt and completion text. Off by default."},
 		{"max_content_chars", "integer", d.MaxContentChars, "Longest single message content exported, in characters."},
 		{"max_trace_content_bytes", "integer", d.MaxTraceContentBytes, "Largest prompt or completion exported for one trace, in bytes. Longer conversations are truncated from the middle of the oldest messages."},

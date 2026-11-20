@@ -110,13 +110,19 @@ func blockToPart(raw any) (part, bool) {
 
 	typ := stringField(m, "type")
 	switch typ {
-	case partText, "":
+	case partText, "input_text", "output_text", "":
 		// Anthropic uses `text`; the semconv and some producers use `content`.
 		if text := firstStringField(m, "text", "content"); text != "" {
 			return part{Type: partText, Content: text}, true
 		}
 		if typ == "" {
 			return unknownBlockPart(m, "")
+		}
+		return part{}, false
+
+	case "refusal":
+		if text := firstStringField(m, "refusal"); text != "" {
+			return part{Type: partText, Content: text}, true
 		}
 		return part{}, false
 
@@ -139,7 +145,7 @@ func blockToPart(raw any) (part, bool) {
 	case partServerToolResp:
 		return toolResultPart(m, partServerToolResp), true
 
-	case "image", "image_url", partBlob, partURI, partFile:
+	case "image", "image_url", "input_image", "input_file", partBlob, partURI, partFile:
 		return mediaPart(m, typ), true
 
 	case "redacted_thinking":
@@ -181,7 +187,7 @@ func unknownBlockPart(m map[string]any, typ string) (part, bool) {
 func toolCallPart(m map[string]any, typ string) part {
 	p := part{
 		Type: partToolCall,
-		ID:   firstStringField(m, "id", "tool_use_id", "call_id", "tool_call_id"),
+		ID:   firstStringField(m, "call_id", "id", "tool_use_id", "tool_call_id"),
 		Name: firstStringField(m, "name", "tool_name"),
 	}
 	if typ == partServerToolCall || typ == "server_tool_use" {
@@ -218,7 +224,7 @@ func toolCallPart(m map[string]any, typ string) part {
 func toolResultPart(m map[string]any, typ string) part {
 	p := part{
 		Type: partToolCallResp,
-		ID:   firstStringField(m, "tool_use_id", "id", "call_id", "tool_call_id"),
+		ID:   firstStringField(m, "tool_use_id", "call_id", "id", "tool_call_id"),
 	}
 	// A result body is `content` (Anthropic) or `output` (Responses API), and
 	// the semconv name for it is `response`.
@@ -400,6 +406,14 @@ func promptMessages(body []byte) []chatMessage {
 // into parts and mapping a `role: "tool"` result to a correlated response part.
 func messageFromMap(m map[string]any) (chatMessage, bool) {
 	role := stringField(m, "role")
+	switch stringField(m, "type") {
+	case "function_call":
+		p := toolCallPart(m, partToolCall)
+		if callID := stringField(m, "call_id"); callID != "" { p.ID = callID }
+		return chatMessage{Role: "assistant", Parts: []part{p}}, true
+	case "function_call_output":
+		return chatMessage{Role: "tool", Parts: []part{toolResultPart(m, partToolCallResp)}}, true
+	}
 	parts := contentParts(m["content"])
 
 	// OpenAI chat: the assistant's tool calls live beside `content`, and the
